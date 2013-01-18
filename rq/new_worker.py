@@ -225,7 +225,6 @@ class BaseWorker(object):
         def request_force_stop(signum, frame):
             """Terminates the application (cold shutdown).
             """
-            print 'PID IS %s' % os.getpid()
             self.log.warning('Cold shut down.')
             # Need to call ``handle_cold_shutdown`` implemented by subclasses
             self.handle_cold_shutdown()
@@ -235,7 +234,7 @@ class BaseWorker(object):
             """Stops the current worker loop but waits for child processes to
             end gracefully (warm shutdown).
             """
-            print 'PID IS %s' % os.getpid()
+
             self.log.debug('Got signal %s.' % signal_name(signum))
 
             signal.signal(signal.SIGINT, request_force_stop)
@@ -246,8 +245,7 @@ class BaseWorker(object):
 
             # If shutdown is requested in the middle of a job, wait until
             # finish before shutting down
-            if self.is_busy():
-                
+            if self.is_busy():                
                 self._stopped = True
                 self.log.debug('Stopping after current horse is finished. '
                                'Press Ctrl+C again for a cold shutdown.')
@@ -256,6 +254,10 @@ class BaseWorker(object):
 
         signal.signal(signal.SIGINT, request_stop)
         signal.signal(signal.SIGTERM, request_stop)
+
+    def is_horse(self):
+        # Worker subclasses have to implement a way of checking a current worker is a horse
+        raise NotImplementedError('Implement this in a subclass.')
 
     def is_busy(self):
         # Each worker class has to implement a way of checking whether it is
@@ -342,7 +344,8 @@ class BaseWorker(object):
                 did_perform_work = True
 
         finally:
-            self.register_death()
+            if not self.is_horse():
+                self.register_death()
         
         return did_perform_work
 
@@ -366,12 +369,14 @@ class ForkingWorker(BaseWorker):
         self._slots = Array('i', [0] * num_processes)
         super(ForkingWorker, self).__init__(*args, **kwargs)
 
+    def is_horse(self):
+        return os.getpid() in self._slots
+
     def is_busy(self):
         # If any of the worker slot is non zero, that means there's a job still running
         return any(self._slots)
 
     def handle_cold_shutdown(self):
-
         for pid in self._slots:
             if pid:
                 msg = 'Taking down horse %d with me.' % pid
@@ -398,9 +403,18 @@ class ForkingWorker(BaseWorker):
         child_pid = os.fork()
         if child_pid == 0:
             random.seed()
+
+            # Always ignore Ctrl+C in the work horse, as it might abort the
+            # currently running job.
+            # The main worker catches the Ctrl+C and requests graceful shutdown
+            # after the current work is done.  When cold shutdown is requested, it
+            # kills the current job anyway.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            
             # Within child
             try:
-                self.fake_work()
+                self.fake_work()                
             finally:
                 # This is the new stuff.  Remember, we're in the child process
                 # currently. When all work is done here, free up the current
@@ -409,11 +423,10 @@ class ForkingWorker(BaseWorker):
                 # (so can safely be forgotten about).
                 self._slots[slot] = 0
                 self._semaphore.release()
-                if self._stopped:
-                    print 'STOP REQUESTED'
                 os._exit(0)
                 
-        else:
+        else:            
+            self.procline('Forked %d at %d' % (child_pid, time.time()))
             # Within parent, keep track of the new child by writing its PID
             # into the first free slot index.
             self._slots[slot] = child_pid
