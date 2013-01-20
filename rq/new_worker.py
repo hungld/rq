@@ -234,8 +234,7 @@ class BaseWorker(object):
             """Stops the current worker loop but waits for child processes to
             end gracefully (warm shutdown).
             """
-
-            self.log.debug('Got signal %s.' % signal_name(signum))
+            self.log.debug('%s Got signal %s.' % (os.getpid(), signal_name(signum)))
 
             signal.signal(signal.SIGINT, request_force_stop)
             signal.signal(signal.SIGTERM, request_force_stop)
@@ -243,26 +242,22 @@ class BaseWorker(object):
             msg = 'Warm shut down requested.'
             self.log.warning(msg)
 
+            # Horses should quit right away if they receive a stop signal
+            if self.is_horse():
+                self.stop_horse()
+
             # If shutdown is requested in the middle of a job, wait until
             # finish before shutting down
-            if self.is_busy():                
+            if self.has_active_horses():                
                 self._stopped = True
                 self.log.debug('Stopping after current horse is finished. '
                                'Press Ctrl+C again for a cold shutdown.')
+                self.quit()
             else:
                 raise StopRequested()
 
         signal.signal(signal.SIGINT, request_stop)
-        signal.signal(signal.SIGTERM, request_stop)
-
-    def is_horse(self):
-        # Worker subclasses have to implement a way of checking a current worker is a horse
-        raise NotImplementedError('Implement this in a subclass.')
-
-    def is_busy(self):
-        # Each worker class has to implement a way of checking whether it is
-        # in the middle of running one or more jobs
-        raise NotImplementedError('Implement this in a subclass.')
+        signal.signal(signal.SIGTERM, request_stop)    
     
     def handle_exception(self, job, *exc_info):
         """Walks the exception handler stack to delegate exception handling."""
@@ -297,6 +292,51 @@ class BaseWorker(object):
         """Pops the latest exception handler off of the exc handler stack."""
         return self._exc_handlers.pop()
 
+    def fetch_job(self, burst=False):
+        """Get a job from Redis to perform. """
+        qnames = self.queue_names()
+        self.procline('%s Listening on %s' % 
+                (self.get_horse_name(), ','.join(qnames)))
+        self.log.info('')
+        self.log.info('*** %s listening on %s...' % \
+                (self.get_horse_name(), green(', '.join(qnames))))
+        wait_for_job = not burst
+
+        try:
+            result = Queue.dequeue_any(self.queues, wait_for_job, \
+                    connection=self.connection)
+        except UnpickleError as e:
+            msg = '*** Ignoring unpickleable data on %s.' % \
+                    green(e.queue.name)
+            self.log.warning(msg)
+            self.log.debug('Data follows:')
+            self.log.debug(e.raw_data)
+            self.log.debug('End of unreadable data.')
+            self.failed_queue.push_job_id(e.job_id)
+        
+        # When a horse starts working, it should ignore Ctrl+C so it doesn't
+        # prematurely terminate currently running job.
+        # The main worker catches the Ctrl+C and requests graceful shutdown
+        # after the current work is done.  When cold shutdown is requested, it
+        # kills the current job anyway.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                
+        job, queue = result
+        # Use the public setter here, to immediately update Redis
+        job.status = Status.STARTED
+        self.log.info('%s working on %s: %s (%s)' % 
+                (self.get_horse_name(), green(queue.name),
+                 blue(job.description), job.id))
+        self.fake_work()
+
+    def quit(self):
+        """ Enters a loop to wait for all children to finish and then quit """
+        while True:
+            if not self.has_active_horses():
+                break
+            time.sleep(1)
+
     def work(self, burst=False):
         self._install_signal_handlers()
         did_perform_work = False
@@ -305,44 +345,18 @@ class BaseWorker(object):
         self.state = 'starting'
         
         try:
-            while True:
+            while True:                
                 if self.stopped:
                     self.log.info('Stopping on request.')
                     break
-
-                qnames = self.queue_names()
-                self.procline('Listening on %s' % ','.join(qnames))
-                self.log.info('')
-                self.log.info('*** Listening on %s...' % \
-                        green(', '.join(qnames)))
-                wait_for_job = not burst
                 try:
-                    result = Queue.dequeue_any(self.queues, wait_for_job, \
-                            connection=self.connection)
-                    if result is None:
-                        break
+                    self.spawn_child()
                 except StopRequested:
-                    break
-                except UnpickleError as e:
-                    msg = '*** Ignoring unpickleable data on %s.' % \
-                            green(e.queue.name)
-                    self.log.warning(msg)
-                    self.log.debug('Data follows:')
-                    self.log.debug(e.raw_data)
-                    self.log.debug('End of unreadable data.')
-                    self.failed_queue.push_job_id(e.job_id)
-                    continue
-
-                job, queue = result
-                # Use the public setter here, to immediately update Redis
-                job.status = Status.STARTED
-                self.log.info('%s: %s (%s)' % (green(queue.name),
-                    blue(job.description), job.id))
-
-                self.spawn_child()
-
-                did_perform_work = True
-
+                    if not self.has_active_horses():
+                        break
+                    else:
+                        self.quit()
+        
         finally:
             if not self.is_horse():
                 self.register_death()
@@ -353,12 +367,40 @@ class BaseWorker(object):
         raise NotImplementedError('Implement this in a subclass.')
 
     def handle_cold_shutdown(self):
+        # This method is called when CTRL + C is pressed twice, has to
+        # terminate all active horses supervised by the worker before exiting
         raise NotImplementedError('Implement this in a subclass.')
+
+    def get_horse_name(self):
+        # A method to return a unique identifier for a horse
+        raise NotImplementedError('Implement this in a subclass.')
+
+    def is_horse(self):
+        # Worker subclasses have to implement a way of checking a current worker is a horse
+        raise NotImplementedError('Implement this in a subclass.')
+
+    def has_active_horses(self):
+        # Each worker class has to implement a way of checking whether it is
+        # in the middle of running one or more jobs
+        raise NotImplementedError('Implement this in a subclass.') 
+
+    def stop_horse(self):
+        raise NotImplementedError('Implement this in a subclass.') 
 
     def fake_work(self):
         sleep_time = 3 * random.random()
         print datetime.datetime.now(), '- Hello from', os.getpid(), '- %.3fs' % sleep_time
         time.sleep(5)
+
+
+def process_is_alive(pid):
+    # Check if a process is alive by sending it a signal that does nothing
+    # If OSError is raised, it means the process is no longer alive
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 class ForkingWorker(BaseWorker):
@@ -367,14 +409,31 @@ class ForkingWorker(BaseWorker):
         # Set up sync primitives, to communicate with the spawned children
         self._semaphore = Semaphore(num_processes)
         self._slots = Array('i', [0] * num_processes)
+        self._horse_pid = None
+        self._horse_slot_number = None
         super(ForkingWorker, self).__init__(*args, **kwargs)
 
     def is_horse(self):
         return os.getpid() in self._slots
 
-    def is_busy(self):
+    def stop_horse(self):
+        # When all work is done here, free up the current
+        # slot (by writing a 0 in the slot position).  This
+        # communicates to the parent that the current child has died
+        # (so can safely be forgotten about).
+        self._semaphore.release()
+        self._slots[self._horse_slot_number] = 0
+        os._exit(0)
+
+    def has_active_horses(self):
         # If any of the worker slot is non zero, that means there's a job still running
-        return any(self._slots)
+        for pid in self._slots:            
+            if pid and process_is_alive(pid):
+                return True
+        return False
+
+    def get_horse_name(self):
+        return 'ForkingWorker (%s)' % self._horse_pid
 
     def handle_cold_shutdown(self):
         for pid in self._slots:
@@ -391,8 +450,14 @@ class ForkingWorker(BaseWorker):
 
     def spawn_child(self):
         """Forks and executes the job."""
-        self._semaphore.acquire()    # responsible for the blocking
-
+        try:
+            self._semaphore.acquire()    # responsible for the blocking
+        except OSError as e:
+            # If SIGINT or SIGTERM is received when blocking to create a child,
+            # signal to the mainloop that it should stop
+            if e.errno != errno.EINTR:
+                raise StopRequested
+        
         # Select an empty slot from self._slots (the first 0 value is picked)
         # The implementation guarantees there will always be at least one empty slot
         for slot, value in enumerate(self._slots):
@@ -403,30 +468,17 @@ class ForkingWorker(BaseWorker):
         child_pid = os.fork()
         if child_pid == 0:
             random.seed()
-
-            # Always ignore Ctrl+C in the work horse, as it might abort the
-            # currently running job.
-            # The main worker catches the Ctrl+C and requests graceful shutdown
-            # after the current work is done.  When cold shutdown is requested, it
-            # kills the current job anyway.
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
             
             # Within child
+            self._horse_pid = os.getpid()
+            self._horse_slot_number = slot
             try:
-                self.fake_work()                
-            finally:
-                # This is the new stuff.  Remember, we're in the child process
-                # currently. When all work is done here, free up the current
-                # slot (by writing a 0 in the slot position).  This
-                # communicates to the parent that the current child has died
-                # (so can safely be forgotten about).
-                self._slots[slot] = 0
-                self._semaphore.release()
-                os._exit(0)
+                self.fetch_job()               
+            finally:                
+                self.stop_horse()
                 
         else:            
             self.procline('Forked %d at %d' % (child_pid, time.time()))
             # Within parent, keep track of the new child by writing its PID
             # into the first free slot index.
-            self._slots[slot] = child_pid
+            self._slots[slot] = child_pid            
