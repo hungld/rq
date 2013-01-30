@@ -1,5 +1,20 @@
+### 0.3.5
+(not yet released)
+
+- `ended_at` is now recorded for normally finished jobs, too.  (Previously only
+  for failed jobs.)
+
+
+### 0.3.4
+(January 23rd, 2013)
+
+- Restore compatibility with Python 2.6.
+
+
 ### 0.3.3
-(not released yet)
+(January 18th, 2013)
+
+- Fix bug where work was lost due to silently ignored unpickle errors.
 
 - Jobs can now access the current `Job` instance from within.  Relevant
   documentation [here](http://python-rq.org/docs/jobs/).
@@ -11,6 +26,8 @@
   documentation [here](http://python-rq.org/docs/jobs/).
 
 - `rqworker` now has an optional `--password` flag.
+
+- Remove `logbook` dependency (in favor of `logging`)
 
 
 ### 0.3.2

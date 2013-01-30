@@ -1,12 +1,11 @@
 language: python
 python:
+  - "2.6"
   - "2.7"
+  - "pypy"
 install:
+  - if [[ $TRAVIS_PYTHON_VERSION == 2.6 ]]; then pip install -r py26-requirements.txt; fi
   - pip install -r requirements.txt
+  #- pip install pytest  # installed by Travis by default already
 script:
-  - sh run_tests -x
-#notifications:
-#  irc:
-#    channels: "irc.freenode.org#sentry"
-#    on_success: change
-#    on_failure: change
+  - py.test

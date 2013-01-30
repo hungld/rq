@@ -3,6 +3,7 @@ import os
 import errno
 import random
 import time
+import times
 try:
     from procname import setprocname
 except ImportError:
@@ -11,16 +12,13 @@ except ImportError:
 import socket
 import signal
 import traceback
+import logging
 from cPickle import dumps
-try:
-    from logbook import Logger
-    Logger = Logger   # Does nothing except it shuts up pyflakes annoying error
-except ImportError:
-    from logging import Logger
 from .queue import Queue, get_failed_queue
 from .connections import get_current_connection
-from .job import Status
+from .job import Job, Status
 from .utils import make_colorizer
+from .logutils import setup_loghandlers
 from .exceptions import NoQueueError, UnpickleError
 from .timeouts import death_penalty_after
 from .version import VERSION
@@ -30,6 +28,8 @@ yellow = make_colorizer('darkyellow')
 blue = make_colorizer('darkblue')
 
 DEFAULT_RESULT_TTL = 500
+logger = logging.getLogger(__name__)
+
 
 class StopRequested(Exception):
     pass
@@ -113,7 +113,7 @@ class Worker(object):
         self._is_horse = False
         self._horse_pid = 0
         self._stopped = False
-        self.log = Logger('worker')
+        self.log = logger
         self.failed_queue = get_failed_queue(connection=self.connection)
 
         # By default, push the "move-to-failed-queue" exception handler onto
@@ -283,6 +283,7 @@ class Worker(object):
 
         The return value indicates whether any jobs were processed.
         """
+        setup_loghandlers()
         self._install_signal_handlers()
 
         did_perform_work = False
@@ -309,13 +310,8 @@ class Worker(object):
                 except StopRequested:
                     break
                 except UnpickleError as e:
-                    msg = '*** Ignoring unpickleable data on %s.' % \
-                            green(e.queue.name)
-                    self.log.warning(msg)
-                    self.log.debug('Data follows:')
-                    self.log.debug(e.raw_data)
-                    self.log.debug('End of unreadable data.')
-                    self.failed_queue.push_job_id(e.job_id)
+                    job = Job.safe_fetch(e.job_id)
+                    self.handle_exception(job, *sys.exc_info())
                     continue
 
                 self.state = 'busy'
@@ -375,7 +371,7 @@ class Worker(object):
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
         self._is_horse = True
-        self.log = Logger('horse')
+        self.log = logger
 
         success = self.perform_job(job)
 
@@ -399,6 +395,7 @@ class Worker(object):
             # use the same exc handling when pickling fails
             pickled_rv = dumps(rv)
             job._status = Status.FINISHED
+            job.ended_at = times.now()
         except:
             # Use the public setter here, to immediately update Redis
             job.status = Status.FAILED
@@ -424,6 +421,7 @@ class Worker(object):
             p = self.connection.pipeline()
             p.hset(job.key, 'result', pickled_rv)
             p.hset(job.key, 'status', job._status)
+            p.hset(job.key, 'ended_at', times.format(job.ended_at, 'UTC'))
             if result_ttl > 0:
                 p.expire(job.key, result_ttl)
                 self.log.info('Result is kept for %d seconds.' % result_ttl)
